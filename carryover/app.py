@@ -23,14 +23,20 @@ from flask import (
 from werkzeug.exceptions import RequestEntityTooLarge
 
 from . import db, store
-from .engine import KIND_LABELS, STATUS_LABELS
-from .ingest import CsvError, MAX_FILE_BYTES, parse_csv
+from .engine import KIND_LABELS, PRECISION_STATUS_LABELS, STATUS_LABELS
+from .ingest import CsvError, MAX_FILE_BYTES, parse_csv, parse_grouping_csv
 
 
 STATE_LABELS = {
     "pending": "待重算",
     "current": "现行结果",
     "stale": "结果已作废",
+}
+
+PRECISION_STATE_LABELS = {
+    "none": "未设定",
+    "pending": "待核查",
+    "current": "现行结论",
 }
 
 
@@ -72,6 +78,42 @@ def _recompute_safely(batch_id: int) -> bool:
         flash("更正已受理，但重算失败；旧判定已作废。", "error")
         return False
     flash(f"重算完成，共 {len(rows)} 条现行结果。", "success")
+    # Carryover is the input of the precision check; recompute it whenever it
+    # was configured and the carryover verdict is now publishable.
+    _recompute_precision_safely(batch_id)
+    return True
+
+
+def _recompute_precision_safely(batch_id: int, flash_result: bool = True) -> bool:
+    """Recompute RSD verdicts; a failure leaves them pending, never stale."""
+    conn = g.db
+    with db.snapshot(conn):
+        batch = store.get_batch(conn, batch_id)
+    if batch is None or batch["precision_state"] == "none":
+        return False
+    try:
+        rows = store.recompute_precision(conn, batch_id)
+    except Exception as exc:  # pragma: no cover - surfaced through tests
+        current_app.logger.exception("batch %s precision failed", batch_id)
+        try:
+            store.mark_precision_failed(
+                conn, batch_id, f"精密度核查失败：{exc}"
+            )
+        except Exception:
+            current_app.logger.exception(
+                "batch %s could not be marked precision-pending", batch_id
+            )
+        flash("精密度核查失败，结论保持待核；可稍后重试。", "error")
+        return False
+    if not rows:
+        flash("残留判定尚未完成，精密度结论保持待核；请先完成重算。", "warning")
+        return False
+    if flash_result:
+        failed = sum(1 for row in rows if row.status != "pass")
+        if failed:
+            flash(f"精密度核查完成：{len(rows)} 组中 {failed} 组无法判定或超限。", "warning")
+        else:
+            flash(f"精密度核查完成：{len(rows)} 组均合格。", "success")
     return True
 
 
@@ -153,19 +195,34 @@ def create_app(database_path: str | None = None, testing: bool = False) -> Flask
         batch, results = store.inspect_results(conn, batch_id)
         if batch is None:
             return render_template("not_found.html"), 404
+        batch, precision = store.inspect_precision(conn, batch_id)
+        if batch is None:  # pragma: no cover - defensive
+            return render_template("not_found.html"), 404
         with db.snapshot(conn):
             revisions = store.get_revisions(conn, batch_id)
             uploads = store.get_upload_log(conn, batch_id)
+            groups = store.get_grouping(conn, batch_id)
+            grouping_uploads = store.get_grouping_uploads(conn, batch_id)
+            grouped_counts: dict[str, int] = {}
+            for group in groups:
+                grouped_counts[group.group] = len(group.injection_nos)
         return render_template(
             "batch.html",
             batch=batch,
             results=results,
+            precision=precision,
             revisions=revisions,
             uploads=uploads,
+            groups=groups,
+            grouped_counts=grouped_counts,
+            grouping_uploads=grouping_uploads,
             state_labels=STATE_LABELS,
+            precision_state_labels=PRECISION_STATE_LABELS,
             status_labels=STATUS_LABELS,
+            precision_status_labels=PRECISION_STATUS_LABELS,
             kind_labels=KIND_LABELS,
             unavailable_reason=_unavailable_reason(batch, results),
+            precision_unavailable_reason=_precision_unavailable_reason(batch, precision),
         )
 
     @app.post("/batches/<int:batch_id>/upload")
@@ -211,6 +268,53 @@ def create_app(database_path: str | None = None, testing: bool = False) -> Flask
             if store.get_batch(conn, batch_id) is None:
                 return render_template("not_found.html"), 404
         _recompute_safely(batch_id)
+        return redirect(url_for("batch_detail", batch_id=batch_id), code=303)
+
+    @app.post("/batches/<int:batch_id>/grouping")
+    def upload_grouping(batch_id: int):
+        conn = get_db()
+        if store.get_batch(conn, batch_id) is None:
+            return render_template("not_found.html"), 404
+
+        try:
+            rsd_limit = _parse_limit(request.form.get("rsd_limit"), "RSD 上限")
+            filename, data = _read_upload()
+            rows = parse_grouping_csv(data)
+        except (ValueError, CsvError) as exc:
+            messages = exc.messages if isinstance(exc, CsvError) else [str(exc)]
+            for message in messages:
+                flash(message, "error")
+            return redirect(url_for("batch_detail", batch_id=batch_id), code=303)
+
+        try:
+            summary = store.accept_grouping(conn, batch_id, rows, rsd_limit, filename)
+        except store.StoreError as exc:
+            flash(str(exc), "error")
+            return redirect(url_for("batch_detail", batch_id=batch_id), code=303)
+
+        flash(
+            f"分组已保存：{summary.group_count} 组、{summary.injection_count} 支进样；"
+            f"RSD 上限 {rsd_limit:g}%。旧精密度结论已失效。",
+            "success",
+        )
+        if summary.unknown:
+            flash(
+                "以下进样号不在批次中，已记录但暂时无法核查："
+                + "、".join(summary.unknown[:20]),
+                "warning",
+            )
+        # A concurrently accepted correction may still be recomputing; the
+        # precision pass below only publishes if carryover is current.
+        _recompute_precision_safely(batch_id)
+        return redirect(url_for("batch_detail", batch_id=batch_id), code=303)
+
+    @app.post("/batches/<int:batch_id>/precision/recompute")
+    def recompute_precision_route(batch_id: int):
+        conn = get_db()
+        with db.snapshot(conn):
+            if store.get_batch(conn, batch_id) is None:
+                return render_template("not_found.html"), 404
+        _recompute_precision_safely(batch_id)
         return redirect(url_for("batch_detail", batch_id=batch_id), code=303)
 
     @app.get("/batches/<int:batch_id>/results.csv")
@@ -279,3 +383,13 @@ def _unavailable_reason(batch: sqlite3.Row, results) -> str | None:
     if batch["result_error"]:
         return f"结果已作废：{batch['result_error']}"
     return "结果已作废，需重新计算后才能查看和下载现行结果。"
+
+
+def _precision_unavailable_reason(batch: sqlite3.Row, precision) -> str | None:
+    if precision is not None:
+        return None
+    if batch["precision_state"] == "none":
+        return "尚未上传分组并设定 RSD 上限。"
+    if batch["precision_error"]:
+        return f"精密度结论已失效：{batch['precision_error']}"
+    return "精密度核查尚未完成，请完成残留重算后重试。"

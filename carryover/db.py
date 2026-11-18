@@ -20,6 +20,14 @@ CREATE TABLE IF NOT EXISTS batches (
     result_version  INTEGER,
     result_error    TEXT,
     computed_at     TEXT,
+    rsd_limit       REAL CHECK (rsd_limit IS NULL OR rsd_limit >= 0),
+    group_version   INTEGER NOT NULL DEFAULT 0,
+    precision_state TEXT NOT NULL DEFAULT 'none'
+                    CHECK (precision_state IN ('none', 'pending', 'current')),
+    precision_data_version  INTEGER,
+    precision_group_version INTEGER,
+    precision_error TEXT,
+    precision_computed_at TEXT,
     created_at      TEXT NOT NULL,
     updated_at      TEXT NOT NULL
 );
@@ -67,6 +75,41 @@ CREATE TABLE IF NOT EXISTS upload_log (
     accepted_count  INTEGER NOT NULL,
     skipped_count   INTEGER NOT NULL,
     created_at      TEXT NOT NULL
+);
+
+-- Current grouping assignment.  The primary key guarantees that one injection
+-- can belong to only one sample group.
+CREATE TABLE IF NOT EXISTS sample_groups (
+    batch_id        INTEGER NOT NULL REFERENCES batches(id) ON DELETE CASCADE,
+    injection_no    TEXT NOT NULL,
+    group_name      TEXT NOT NULL,
+    position        INTEGER NOT NULL DEFAULT 0,
+    updated_at      TEXT NOT NULL,
+    PRIMARY KEY (batch_id, injection_no)
+);
+
+CREATE TABLE IF NOT EXISTS grouping_uploads (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id        INTEGER NOT NULL REFERENCES batches(id) ON DELETE CASCADE,
+    filename        TEXT NOT NULL,
+    injection_count INTEGER NOT NULL,
+    created_at      TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS precision_results (
+    batch_id        INTEGER NOT NULL REFERENCES batches(id) ON DELETE CASCADE,
+    group_name      TEXT NOT NULL,
+    seq             INTEGER NOT NULL,
+    status          TEXT NOT NULL
+                    CHECK (status IN ('pass', 'fail', 'unverified')),
+    group_size      INTEGER NOT NULL,
+    sample_count    INTEGER NOT NULL,
+    mean_area       REAL,
+    stdev_area      REAL,
+    rsd_percent     REAL,
+    reason          TEXT NOT NULL DEFAULT '',
+    note            TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (batch_id, group_name)
 );
 
 CREATE INDEX IF NOT EXISTS idx_revisions_batch
@@ -129,6 +172,7 @@ def init_db(conn: sqlite3.Connection, attempts: int = 5) -> None:
                 raise
             time.sleep(0.1 * (attempt + 1))
     conn.executescript(SCHEMA)
+    _migrate(conn)
 
     # A crash or a failed recompute can leave a batch whose stored rows are
     # older than its accepted revisions.  Never let that combination appear
@@ -156,5 +200,83 @@ def init_db(conn: sqlite3.Connection, attempts: int = 5) -> None:
                      OR result_version IS NULL
                      OR result_version != data_version
              )
+            """
+        )
+        # Precision verdicts depend on both the accepted revisions and the
+        # current grouping.  A restart must not resurrect a verdict whose
+        # inputs have moved since it was computed.
+        conn.execute(
+            """
+            UPDATE batches
+               SET precision_state = 'pending',
+                   precision_error = COALESCE(
+                       precision_error,
+                       '服务重启后发现精密度结论与数据或分组版本不一致，已作废'
+                   )
+             WHERE precision_state = 'current'
+               AND (precision_data_version IS NULL
+                    OR precision_data_version != data_version
+                    OR precision_group_version IS NULL
+                    OR precision_group_version != group_version
+                    OR result_state != 'current'
+                    OR result_version IS NULL
+                    OR result_version != data_version)
+            """
+        )
+        conn.execute(
+            """
+            DELETE FROM precision_results
+             WHERE batch_id IN (
+                 SELECT id FROM batches
+                  WHERE precision_state != 'current'
+                     OR precision_data_version IS NULL
+                     OR precision_data_version != data_version
+                     OR precision_group_version IS NULL
+                     OR precision_group_version != group_version
+                     OR result_state != 'current'
+                     OR result_version IS NULL
+                     OR result_version != data_version
+             )
+            """
+        )
+
+
+# Columns added after the first release; named volumes survive image upgrades.
+_NEW_BATCH_COLUMNS = {
+    "rsd_limit": "REAL CHECK (rsd_limit IS NULL OR rsd_limit >= 0)",
+    "group_version": "INTEGER NOT NULL DEFAULT 0",
+    "precision_state": (
+        "TEXT NOT NULL DEFAULT 'none' "
+        "CHECK (precision_state IN ('none', 'pending', 'current'))"
+    ),
+    "precision_data_version": "INTEGER",
+    "precision_group_version": "INTEGER",
+    "precision_error": "TEXT",
+    "precision_computed_at": "TEXT",
+}
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    existing = {
+        row[1] for row in conn.execute("PRAGMA table_info(batches)").fetchall()
+    }
+    missing = [
+        (name, ddl) for name, ddl in _NEW_BATCH_COLUMNS.items() if name not in existing
+    ]
+    if not missing:
+        return
+    with immediate(conn):
+        for name, ddl in missing:
+            conn.execute(f"ALTER TABLE batches ADD COLUMN {name} {ddl}")
+        # A batch created before precision existed has no grouping; anything
+        # that somehow claims a precision verdict must be re-verified.
+        conn.execute(
+            """
+            UPDATE batches
+               SET precision_state = 'none',
+                   precision_error = NULL,
+                   precision_data_version = NULL,
+                   precision_group_version = NULL
+             WHERE rsd_limit IS NULL
             """
         )

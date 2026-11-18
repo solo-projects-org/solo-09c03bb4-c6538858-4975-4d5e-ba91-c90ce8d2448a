@@ -11,6 +11,7 @@ the episode.  A later high sample becomes the new trigger.
 from __future__ import annotations
 
 import re
+import statistics
 from dataclasses import dataclass
 from typing import Iterable, Optional
 
@@ -134,6 +135,155 @@ def compute_results(
                 status=status,
                 trigger_injection=trigger_for_row,
                 note=note,
+            )
+        )
+
+    return results
+
+
+# --- precision (repeat-injection RSD) ---------------------------------------
+
+PRECISION_PASS = "pass"
+PRECISION_FAIL = "fail"
+PRECISION_UNVERIFIED = "unverified"
+
+PRECISION_STATUS_LABELS = {
+    PRECISION_PASS: "合格",
+    PRECISION_FAIL: "超限",
+    PRECISION_UNVERIFIED: "无法核查",
+}
+
+# Reasons a group cannot be verified.  They are deliberately specific so the
+# page can tell the operator what to fix.
+UNVERIFIED_TOO_FEW = "too_few"
+UNVERIFIED_MISSING = "missing"
+UNVERIFIED_CARRYOVER = "carryover"
+UNVERIFIED_ZERO_MEAN = "zero_mean"
+
+UNVERIFIED_REASONS = {
+    UNVERIFIED_TOO_FEW: "现行样品进样不足两支，无法核查精密度",
+    UNVERIFIED_MISSING: "分组内进样缺失或峰面积缺失，无法核查精密度",
+    UNVERIFIED_CARRYOVER: "分组内出现残留风险，无法核查精密度",
+    UNVERIFIED_ZERO_MEAN: "峰面积均值为零，无法核查精密度",
+}
+
+
+@dataclass(frozen=True)
+class PrecisionGroup:
+    group: str
+    injection_nos: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class PrecisionResult:
+    group: str
+    status: str
+    count: int
+    mean: Optional[float]
+    stdev: Optional[float]
+    rsd: Optional[float]
+    reason: str
+    note: str
+
+
+def compute_precision(
+    groups: Iterable[PrecisionGroup],
+    injections: Iterable[Injection],
+    carryover: Iterable[ResultRow],
+    rsd_limit: float,
+) -> list[PrecisionResult]:
+    """Compute RSD per group using only current sample injections.
+
+    Every injection may belong to at most one group (enforced by the caller
+    when the grouping CSV is accepted).  A group is verifiable only when it
+    holds at least two current sample injections with peak areas, none of those
+    injections carries a carryover-risk verdict, and the mean is non-zero.
+    """
+    current = {row.injection_no: row for row in injections}
+    risk = {
+        row.injection_no
+        for row in carryover
+        if row.status == CARRYOVER_RISK
+    }
+    results: list[PrecisionResult] = []
+
+    for group in groups:
+        numbers = list(group.injection_nos)
+        missing = [no for no in numbers if no not in current]
+        if missing:
+            results.append(
+                PrecisionResult(
+                    group.group, PRECISION_UNVERIFIED, 0, None, None,
+                    None, UNVERIFIED_MISSING,
+                    UNVERIFIED_REASONS[UNVERIFIED_MISSING]
+                    + f"（缺少进样 {', '.join(missing)}）",
+                )
+            )
+            continue
+
+        # Only current sample injections contribute; blanks listed in the
+        # grouping are not observations of the sample's repeatability.
+        rows = [
+            current[no] for no in numbers
+            if current[no].kind == SAMPLE
+        ]
+        excluded = [no for no in numbers if current[no].kind != SAMPLE]
+        absent_area = [row.injection_no for row in rows if row.peak_area is None]
+        if absent_area:
+            results.append(
+                PrecisionResult(
+                    group.group, PRECISION_UNVERIFIED, len(rows), None, None,
+                    None, UNVERIFIED_MISSING,
+                    UNVERIFIED_REASONS[UNVERIFIED_MISSING]
+                    + "（峰面积缺失：" + ", ".join(absent_area) + "）",
+                )
+            )
+            continue
+
+        if len(rows) < 2:
+            note = UNVERIFIED_REASONS[UNVERIFIED_TOO_FEW]
+            if excluded:
+                note += f"（已忽略非样品进样 {', '.join(excluded)}）"
+            results.append(
+                PrecisionResult(
+                    group.group, PRECISION_UNVERIFIED, len(rows), None, None,
+                    None, UNVERIFIED_TOO_FEW, note,
+                )
+            )
+            continue
+
+        risky = [row.injection_no for row in rows if row.injection_no in risk]
+        if risky:
+            results.append(
+                PrecisionResult(
+                    group.group, PRECISION_UNVERIFIED, len(rows), None, None,
+                    None, UNVERIFIED_CARRYOVER,
+                    UNVERIFIED_REASONS[UNVERIFIED_CARRYOVER]
+                    + f"（进样 {', '.join(risky)}）",
+                )
+            )
+            continue
+
+        areas = [float(row.peak_area) for row in rows]
+        mean = statistics.fmean(areas)
+        if mean == 0:
+            results.append(
+                PrecisionResult(
+                    group.group, PRECISION_UNVERIFIED, len(rows), 0.0, None,
+                    None, UNVERIFIED_ZERO_MEAN,
+                    UNVERIFIED_REASONS[UNVERIFIED_ZERO_MEAN],
+                )
+            )
+            continue
+
+        stdev = statistics.stdev(areas)  # sample standard deviation (n - 1)
+        rsd = stdev / abs(mean) * 100.0
+        status = PRECISION_PASS if rsd <= rsd_limit else PRECISION_FAIL
+        results.append(
+            PrecisionResult(
+                group.group, status, len(rows), mean, stdev, rsd, "",
+                f"RSD {rsd:.2f}% {'≤' if status == PRECISION_PASS else '>'} "
+                f"上限 {rsd_limit:g}%",
             )
         )
 

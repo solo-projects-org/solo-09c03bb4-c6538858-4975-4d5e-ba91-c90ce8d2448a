@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -196,7 +197,8 @@ def accept_upload(
                 _upsert_injection(conn, batch_id, row, now, position)
             data_version += 1
             # The old result is invalid the moment a correction is accepted,
-            # before any recompute is attempted.
+            # before any recompute is attempted.  Precision verdicts depend on
+            # the corrected rows, so they expire in the same transaction.
             conn.execute("DELETE FROM results WHERE batch_id = ?", (batch_id,))
             conn.execute(
                 """
@@ -206,6 +208,10 @@ def accept_upload(
                  WHERE id = ?
                 """,
                 (data_version, PENDING, now, batch_id),
+            )
+            _invalidate_precision(
+                conn, batch_id, now,
+                "受理更正后数据版本已更新，精密度需重新核查",
             )
 
         _log_upload(conn, batch_id, filename, len(accepted), skipped)
@@ -279,6 +285,12 @@ def recompute(conn: sqlite3.Connection, batch_id: int) -> list[ResultRow]:
         )
         if cursor.rowcount != 1:  # pragma: no cover - defensive only
             raise StoreError("结果版本更新失败")
+        # Carryover inputs changed, so any previously published precision
+        # verdicts expire with them.  They are recomputed afterwards.
+        _invalidate_precision(
+            conn, batch_id, utcnow(),
+            "残留判定已重算，精密度需按现行结果重新核查",
+        )
     return results
 
 
@@ -310,6 +322,8 @@ def mark_failed(conn: sqlite3.Connection, batch_id: int, message: str) -> None:
             """,
             (STALE, message[:2000], now, batch_id),
         )
+        # The carryover verdict is now invalid, and precision depends on it.
+        _invalidate_precision(conn, batch_id, now, "残留判定已作废，精密度需重新核查")
 
 
 def inspect_results(
@@ -361,6 +375,10 @@ def inspect_results(
                  WHERE id = ?
                 """,
                 (STALE, "现行结果与已受理修订不一致，已作废", utcnow(), batch_id),
+            )
+            _invalidate_precision(
+                conn, batch_id, utcnow(),
+                "残留判定已作废，精密度需重新核查",
             )
             return get_batch(conn, batch_id), None
         return batch, results
@@ -416,3 +434,403 @@ def get_upload_log(
         """,
         (batch_id, limit),
     ).fetchall()
+
+
+# --- precision (repeat-injection RSD) ---------------------------------------
+
+@dataclass(frozen=True)
+class GroupingSummary:
+    injection_count: int
+    group_count: int
+    group_version: int
+    unknown: tuple[str, ...]
+
+
+def _invalidate_precision(
+    conn: sqlite3.Connection,
+    batch_id: int,
+    now: str,
+    error: Optional[str],
+) -> None:
+    """Drop every stored precision verdict; it may never outlive its inputs."""
+    conn.execute("DELETE FROM precision_results WHERE batch_id = ?", (batch_id,))
+    has_groups = conn.execute(
+        "SELECT 1 FROM sample_groups WHERE batch_id = ? LIMIT 1", (batch_id,)
+    ).fetchone()
+    if not has_groups:
+        # Nothing was requested yet: stay "not configured" instead of asking
+        # the operator to verify a grouping that does not exist.
+        conn.execute(
+            """
+            UPDATE batches
+               SET precision_state = 'none', precision_error = NULL,
+                   precision_data_version = NULL,
+                   precision_group_version = NULL, updated_at = ?
+             WHERE id = ?
+            """,
+            (now, batch_id),
+        )
+        return
+    conn.execute(
+        """
+        UPDATE batches
+           SET precision_state = ?, precision_data_version = NULL,
+               precision_group_version = NULL, precision_error = ?,
+               updated_at = ?
+         WHERE id = ?
+        """,
+        (PENDING, error, now, batch_id),
+    )
+
+
+def accept_grouping(
+    conn: sqlite3.Connection,
+    batch_id: int,
+    rows: Iterable[GroupRow],
+    rsd_limit: float,
+    filename: str,
+) -> GroupingSummary:
+    """Replace the batch grouping and RSD limit atomically.
+
+    A whole-file replacement is used so re-assigning an injection to another
+    group cannot leave a duplicate behind.  The old precision verdicts are
+    removed in the same transaction as the new grouping.
+    """
+    rows = list(rows)
+    now = utcnow()
+    with immediate(conn):
+        batch = get_batch(conn, batch_id)
+        if batch is None:
+            raise StoreError("批次不存在")
+
+        known = {
+            row["injection_no"]
+            for row in conn.execute(
+                "SELECT injection_no FROM injections WHERE batch_id = ?",
+                (batch_id,),
+            )
+        }
+        unknown = tuple(dict.fromkeys(
+            row.injection_no for row in rows if row.injection_no not in known
+        ))
+
+        conn.execute("DELETE FROM sample_groups WHERE batch_id = ?", (batch_id,))
+        for position, row in enumerate(rows, start=1):
+            conn.execute(
+                """
+                INSERT INTO sample_groups
+                    (batch_id, injection_no, group_name, position, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (batch_id, row.injection_no, row.group, position, now),
+            )
+
+        group_version = batch["group_version"] + 1
+        conn.execute(
+            """
+            UPDATE batches
+               SET rsd_limit = ?, group_version = ?, updated_at = ?
+             WHERE id = ?
+            """,
+            (rsd_limit, group_version, now, batch_id),
+        )
+        _invalidate_precision(conn, batch_id, now, None)
+        conn.execute(
+            """
+            INSERT INTO grouping_uploads
+                (batch_id, filename, injection_count, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (batch_id, filename[:255], len(rows), now),
+        )
+
+    return GroupingSummary(
+        injection_count=len(rows),
+        group_count=len({row.group for row in rows}),
+        group_version=group_version,
+        unknown=unknown,
+    )
+
+
+def get_grouping(
+    conn: sqlite3.Connection, batch_id: int
+) -> list[engine.PrecisionGroup]:
+    rows = conn.execute(
+        """
+        SELECT group_name, injection_no
+          FROM sample_groups WHERE batch_id = ? ORDER BY position, injection_no
+        """,
+        (batch_id,),
+    ).fetchall()
+    grouped: dict[str, list[str]] = {}
+    order: list[str] = []
+    for row in rows:
+        name = row["group_name"]
+        if name not in grouped:
+            grouped[name] = []
+            order.append(name)
+        grouped[name].append(row["injection_no"])
+    return [
+        engine.PrecisionGroup(name, tuple(grouped[name])) for name in order
+    ]
+
+
+def get_grouping_uploads(
+    conn: sqlite3.Connection, batch_id: int, limit: int = 30
+) -> list[sqlite3.Row]:
+    return conn.execute(
+        """
+        SELECT * FROM grouping_uploads
+         WHERE batch_id = ? ORDER BY id DESC LIMIT ?
+        """,
+        (batch_id, limit),
+    ).fetchall()
+
+
+def recompute_precision(conn: sqlite3.Connection, batch_id: int) -> list[engine.PrecisionResult]:
+    """Recompute RSD verdicts from current rows only.
+
+    Precision requires a current carryover verdict: a group is unverifiable
+    when its injections may be affected by carryover.  If the carryover result
+    is pending or stale (a correction or a failed recompute), no precision is
+    published; the batch is left pending so the page can retry.
+    """
+    with immediate(conn):
+        batch = get_batch(conn, batch_id)
+        if batch is None:
+            raise StoreError("批次不存在")
+        if batch["rsd_limit"] is None:
+            raise StoreError("尚未设定 RSD 上限")
+        groups = get_grouping(conn, batch_id)
+        if not groups:
+            raise StoreError("尚未上传分组")
+
+        if (
+            batch["result_state"] != CURRENT
+            or batch["result_version"] is None
+            or batch["result_version"] != batch["data_version"]
+        ):
+            # Deliberately leave nothing publishable behind.
+            _invalidate_precision(
+                conn, batch_id, utcnow(),
+                "残留判定尚未重算完成，精密度核查保持待核",
+            )
+            return []
+
+        injections = [
+            Injection(
+                injection_no=row["injection_no"],
+                kind=row["kind"],
+                peak_area=row["peak_area"],
+                revision=row["revision"],
+                position=row["position"],
+            )
+            for row in conn.execute(
+                """
+                SELECT injection_no, kind, peak_area, revision, position
+                  FROM injections WHERE batch_id = ?
+                 ORDER BY position, injection_no
+                """,
+                (batch_id,),
+            )
+        ]
+        carryover = [
+            ResultRow(
+                injection_no=row["injection_no"],
+                kind=row["kind"],
+                peak_area=row["peak_area"],
+                revision=row["revision"],
+                status=row["status"],
+                trigger_injection=row["trigger_injection"],
+                note=row["note"],
+            )
+            for row in conn.execute(
+                "SELECT * FROM results WHERE batch_id = ? ORDER BY seq",
+                (batch_id,),
+            )
+        ]
+        results = engine.compute_precision(
+            groups, injections, carryover, float(batch["rsd_limit"])
+        )
+        group_sizes = {group.group: len(group.injection_nos) for group in groups}
+
+        snapshot_data = batch["data_version"]
+        snapshot_groups = batch["group_version"]
+        conn.execute("DELETE FROM precision_results WHERE batch_id = ?", (batch_id,))
+        for seq, result in enumerate(results, start=1):
+            conn.execute(
+                """
+                INSERT INTO precision_results
+                    (batch_id, group_name, seq, status, group_size, sample_count,
+                     mean_area, stdev_area, rsd_percent, reason, note)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    batch_id, result.group, seq, result.status,
+                    group_sizes.get(result.group, result.count),
+                    result.count, result.mean, result.stdev, result.rsd,
+                    result.reason, result.note,
+                ),
+            )
+        cursor = conn.execute(
+            """
+            UPDATE batches
+               SET precision_state = ?, precision_data_version = ?,
+                   precision_group_version = ?, precision_error = NULL,
+                   precision_computed_at = ?, updated_at = ?
+             WHERE id = ? AND data_version = ? AND group_version = ?
+            """,
+            (
+                CURRENT, snapshot_data, snapshot_groups, utcnow(), utcnow(),
+                batch_id, snapshot_data, snapshot_groups,
+            ),
+        )
+        if cursor.rowcount != 1:  # pragma: no cover - defensive only
+            raise StoreError("精密度版本更新失败")
+    return results
+
+
+def mark_precision_failed(conn: sqlite3.Connection, batch_id: int, message: str) -> None:
+    now = utcnow()
+    with immediate(conn):
+        batch = get_batch(conn, batch_id)
+        if batch is None:
+            return
+        if _precision_versions_current(batch):
+            return
+        _invalidate_precision(conn, batch_id, now, message[:2000])
+
+
+def inspect_precision(
+    conn: sqlite3.Connection, batch_id: int
+) -> tuple[Optional[sqlite3.Row], Optional[list[sqlite3.Row]]]:
+    """Return (batch, precision rows or None), invalidating forged rows."""
+    with snapshot(conn):
+        batch = get_batch(conn, batch_id)
+        if batch is None:
+            return None, None
+        if not _precision_versions_current(batch):
+            if batch["precision_state"] != CURRENT:
+                return batch, None
+            # A "current" stamp that no longer matches its inputs: fall
+            # through to the write transaction so the rows cannot survive.
+        else:
+            rows = conn.execute(
+                "SELECT * FROM precision_results WHERE batch_id = ? ORDER BY seq",
+                (batch_id,),
+            ).fetchall()
+            if _precision_is_consistent(conn, batch, rows):
+                return batch, rows
+
+    with immediate(conn):
+        batch = get_batch(conn, batch_id)
+        if batch is None:
+            return None, None
+        if batch["precision_state"] != CURRENT:
+            return batch, None
+        rows = conn.execute(
+            "SELECT * FROM precision_results WHERE batch_id = ? ORDER BY seq",
+            (batch_id,),
+        ).fetchall()
+        if not _precision_versions_current(batch) or not _precision_is_consistent(
+            conn, batch, rows
+        ):
+            _invalidate_precision(
+                conn, batch_id, utcnow(), "精密度结论与现行数据或分组不一致，已作废"
+            )
+            return get_batch(conn, batch_id), None
+        return batch, rows
+
+
+def _precision_versions_current(batch: sqlite3.Row) -> bool:
+    return (
+        batch["precision_state"] == CURRENT
+        and batch["rsd_limit"] is not None
+        and batch["precision_data_version"] is not None
+        and batch["precision_data_version"] == batch["data_version"]
+        and batch["precision_group_version"] is not None
+        and batch["precision_group_version"] == batch["group_version"]
+        # Precision is derived from the carryover verdict; if that is not
+        # current either, the precision verdict cannot be published.
+        and batch["result_state"] == CURRENT
+        and batch["result_version"] is not None
+        and batch["result_version"] == batch["data_version"]
+    )
+
+
+def _precision_is_consistent(
+    conn: sqlite3.Connection,
+    batch: sqlite3.Row,
+    rows: list[sqlite3.Row],
+) -> bool:
+    """Recompute from current rows and require an exact match with what is stored.
+
+    A version stamp alone cannot prove the stored numbers came from the
+    current revisions; this check makes forged or mixed rows impossible to
+    publish.
+    """
+    groups = get_grouping(conn, batch["id"])
+    if not groups or len(rows) != len(groups):
+        return False
+    injections = [
+        Injection(
+            injection_no=row["injection_no"],
+            kind=row["kind"],
+            peak_area=row["peak_area"],
+            revision=row["revision"],
+            position=row["position"],
+        )
+        for row in conn.execute(
+            """
+            SELECT injection_no, kind, peak_area, revision, position
+              FROM injections WHERE batch_id = ?
+             ORDER BY position, injection_no
+            """,
+            (batch["id"],),
+        )
+    ]
+    carryover = [
+        ResultRow(
+            injection_no=row["injection_no"],
+            kind=row["kind"],
+            peak_area=row["peak_area"],
+            revision=row["revision"],
+            status=row["status"],
+            trigger_injection=row["trigger_injection"],
+            note=row["note"],
+        )
+        for row in conn.execute(
+            "SELECT * FROM results WHERE batch_id = ? ORDER BY seq", (batch["id"],)
+        )
+    ]
+    expected = {
+        result.group: result
+        for result in engine.compute_precision(
+            groups, injections, carryover, float(batch["rsd_limit"])
+        )
+    }
+    sizes = {group.group: len(group.injection_nos) for group in groups}
+    stored = {row["group_name"]: row for row in rows}
+    if set(expected) != set(stored):
+        return False
+    for name, want in expected.items():
+        have = stored[name]
+        if (
+            have["status"] != want.status
+            or have["group_size"] != sizes[name]
+            or have["sample_count"] != want.count
+            or have["reason"] != want.reason
+        ):
+            return False
+        for column, value in (
+            ("mean_area", want.mean),
+            ("stdev_area", want.stdev),
+            ("rsd_percent", want.rsd),
+        ):
+            got = have[column]
+            if (got is None) != (value is None):
+                return False
+            if got is not None and value is not None:
+                if not math.isclose(got, value, rel_tol=1e-9, abs_tol=1e-12):
+                    return False
+    return True

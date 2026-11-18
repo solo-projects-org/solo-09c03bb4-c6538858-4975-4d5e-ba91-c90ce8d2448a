@@ -9,6 +9,8 @@
         高值阈值 {{ '%g'|format(batch.high_threshold) }} ·
         空白上限 {{ '%g'|format(batch.blank_limit) }} ·
         数据版本 {{ batch.data_version }}
+        {% if batch.rsd_limit is not none %}· RSD 上限 {{ '%g'|format(batch.rsd_limit) }}%{% endif %}
+        {% if batch.group_version %}· 分组版本 {{ batch.group_version }}{% endif %}
       </p>
     </div>
     <div class="actions">
@@ -50,6 +52,88 @@
 </section>
 
 <section class="card">
+  <h2>精密度核查（重复进样峰面积 RSD）</h2>
+  <p class="hint">
+    上传「样品号 + 进样号」分组 CSV 并设定本批 RSD 上限；一支进样只能归属一组。
+    每组只用现行样品进样、按现行残留判定计算平均峰面积、样本标准差与 RSD；
+    进样不足两支、进样缺失、出现残留风险或均值为零时无法核查，不沿用旧结论。
+  </p>
+
+  <form method="post" action="{{ url_for('upload_grouping', batch_id=batch.id) }}" enctype="multipart/form-data" class="inline">
+    <label>RSD 上限（%）
+      <input type="number" name="rsd_limit" step="any" min="0" required
+             value="{{ '%g'|format(batch.rsd_limit) if batch.rsd_limit is not none else '' }}">
+    </label>
+    <label>分组 CSV
+      <input type="file" name="csv_file" accept=".csv,text/csv" required>
+    </label>
+    <button type="submit">保存分组并核查</button>
+  </form>
+
+  <p class="state">
+    精密度结论状态：
+    {% if precision is not none %}
+      <span class="badge ok">现行结论（数据版本 {{ batch.precision_data_version }}，分组版本 {{ batch.precision_group_version }}）</span>
+      <span class="hint">计算于 {{ batch.precision_computed_at }}</span>
+    {% else %}
+      <span class="badge {{ 'warn' if batch.precision_state == 'pending' else 'bad' if batch.precision_state == 'current' else '' }}">
+        {{ precision_state_labels.get(batch.precision_state, batch.precision_state) }}
+      </span>
+      <span class="hint">{{ precision_unavailable_reason }}</span>
+    {% endif %}
+  </p>
+
+  {% if precision is not none %}
+  <table>
+    <thead>
+      <tr><th>样品号</th><th>进样数</th><th>有效样品数</th><th>平均峰面积</th><th>样本标准差</th><th>RSD</th><th>结论</th><th>说明</th></tr>
+    </thead>
+    <tbody>
+      {% for row in precision %}
+      <tr class="precision-{{ row.status }}">
+        <td>{{ row.group_name }}</td>
+        <td>{{ row.group_size }}</td>
+        <td>{{ row.sample_count }}</td>
+        <td>{{ '' if row.mean_area is none else '%.6g'|format(row.mean_area) }}</td>
+        <td>{{ '' if row.stdev_area is none else '%.6g'|format(row.stdev_area) }}</td>
+        <td>{{ '' if row.rsd_percent is none else '%.2f'|format(row.rsd_percent) ~ '%' }}</td>
+        <td><span class="badge precision">{{ precision_status_labels.get(row.status, row.status) }}</span></td>
+        <td class="note">{{ row.note }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="empty">暂无精密度结论。{{ precision_unavailable_reason }}</p>
+  {% endif %}
+
+  <div class="actions">
+    <form method="post" action="{{ url_for('recompute_precision_route', batch_id=batch.id) }}">
+      <button type="submit" class="secondary" {% if batch.precision_state == 'none' %}disabled{% endif %}>重新核查精密度</button>
+    </form>
+  </div>
+  {% if batch.precision_state == 'none' %}<p class="hint">请先上传分组 CSV 并设定 RSD 上限。</p>{% endif %}
+</section>
+
+{% if groups %}
+<section class="card">
+  <h2>当前分组</h2>
+  <table class="compact">
+    <thead><tr><th>样品号</th><th>进样数</th><th>进样号</th></tr></thead>
+    <tbody>
+      {% for group in groups %}
+      <tr>
+        <td>{{ group.group }}</td>
+        <td>{{ grouped_counts.get(group.group, group.injection_nos|length) }}</td>
+        <td class="mono">{{ group.injection_nos|join('、') }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endif %}
+
+<section class="card">
   <h2>整批现行结果</h2>
   {% if results is not none %}
   <table>
@@ -74,6 +158,24 @@
   <p class="empty">暂无可展示的现行结果。{{ unavailable_reason }}</p>
   {% endif %}
 </section>
+
+{% if grouping_uploads %}
+<section class="card">
+  <h2>分组上传记录</h2>
+  <table class="compact">
+    <thead><tr><th>文件</th><th>进样数</th><th>时间</th></tr></thead>
+    <tbody>
+      {% for row in grouping_uploads %}
+      <tr>
+        <td>{{ row.filename }}</td>
+        <td>{{ row.injection_count }}</td>
+        <td class="mono">{{ row.created_at }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endif %}
 
 <section class="card two-col">
   <div>

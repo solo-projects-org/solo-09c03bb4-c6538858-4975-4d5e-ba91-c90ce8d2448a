@@ -208,3 +208,120 @@ def parse_csv(data: bytes) -> list[ParsedRow]:
         # A lower revision in the same file is superseded; ignore it.
 
     return [highest[no] for no in order]
+
+
+# --- grouping CSV -----------------------------------------------------------
+
+GROUP_HEADER_ALIASES = {
+    "group": {
+        "group", "group_name", "group name", "sample_group", "sample group",
+        "sample_no", "sample no", "sample", "sample_id", "sample id",
+        "样品号", "样品编号", "样品", "组别", "组", "分组",
+    },
+    "injection_no": {
+        "injection_no", "injection no", "injection", "injection_number",
+        "injection number", "vial", "vial_no", "vial no", "进样号",
+        "进样编号", "进样", "序号", "瓶号",
+    },
+}
+
+
+@dataclass(frozen=True)
+class GroupRow:
+    group: str
+    injection_no: str
+
+
+def _group_header_map(fieldnames: list[str] | None) -> dict[str, int]:
+    if not fieldnames:
+        raise CsvError("分组 CSV 缺少表头")
+    normalised: dict[str, int] = {}
+    for index, raw in enumerate(fieldnames):
+        name = _normalise_header(raw or "")
+        if not name:
+            continue
+        for canonical, aliases in GROUP_HEADER_ALIASES.items():
+            if name in aliases:
+                if canonical in normalised:
+                    raise CsvError(f"分组 CSV 表头重复定义了 {canonical} 列")
+                normalised[canonical] = index
+                break
+    missing = [name for name in GROUP_HEADER_ALIASES if name not in normalised]
+    if missing:
+        labels = {"group": "样品号", "injection_no": "进样号"}
+        raise CsvError(
+            "分组 CSV 缺少必需列：" + "、".join(labels[name] for name in missing)
+        )
+    return normalised
+
+
+def _check_group_text(value: str, label: str, line: int) -> str:
+    if not value:
+        raise ValueError(f"第 {line} 行缺少{label}")
+    if len(value) > 64:
+        raise ValueError(f"第 {line} 行{label}超过 64 个字符")
+    if any(ord(ch) < 32 for ch in value):
+        raise ValueError(f"第 {line} 行{label}包含控制字符")
+    return value
+
+
+def parse_grouping_csv(data: bytes) -> list[GroupRow]:
+    """Parse a grouping CSV: one row = one injection in one sample group.
+
+    The same injection number may appear only once across the whole file, so a
+    correction cannot silently move an injection between groups by listing it
+    twice.
+    """
+    text = decode_csv(data)
+    reader = csv.reader(io.StringIO(text, newline=""))
+    try:
+        header = next(reader)
+    except StopIteration:
+        raise CsvError("分组 CSV 文件为空") from None
+
+    positions = _group_header_map(header)
+    parsed: list[GroupRow] = []
+    errors: list[str] = []
+
+    for line, cells in enumerate(reader, start=2):
+        if not cells or all(not cell.strip() for cell in cells):
+            continue
+
+        def cell(name: str) -> str:
+            index = positions[name]
+            return cells[index] if index < len(cells) else ""
+
+        try:
+            group = _check_group_text(cell("group").strip(), "样品号", line)
+            injection_no = _check_group_text(
+                cell("injection_no").strip(), "进样号", line
+            )
+            parsed.append(GroupRow(group, injection_no))
+        except ValueError as exc:
+            errors.append(str(exc))
+            if len(errors) >= MAX_ERRORS:
+                errors.append(f"错误过多，仅显示前 {MAX_ERRORS} 条")
+                break
+
+    if errors:
+        raise CsvError(errors)
+    if not parsed:
+        raise CsvError("分组 CSV 没有数据行")
+
+    # One injection belongs to exactly one group.  Identical repeated rows are
+    # redundant and dropped; conflicting assignments reject the whole file.
+    assignment: dict[str, str] = {}
+    deduped: list[GroupRow] = []
+    for row in parsed:
+        previous = assignment.get(row.injection_no)
+        if previous is None:
+            assignment[row.injection_no] = row.group
+            deduped.append(row)
+        elif previous != row.group:
+            raise CsvError(
+                f"进样号 {row.injection_no} 同时归属样品组 "
+                f"“{previous}”和“{row.group}”，一支进样只能归属一组"
+            )
+
+    return deduped
+
